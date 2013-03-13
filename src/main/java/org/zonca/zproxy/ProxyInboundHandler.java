@@ -1,7 +1,11 @@
 package org.zonca.zproxy;
 
 import java.net.InetSocketAddress;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import com.google.common.util.concurrent.RateLimiter;
 import org.jboss.netty.bootstrap.ClientBootstrap;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
@@ -14,11 +18,18 @@ import org.jboss.netty.channel.ExceptionEvent;
 import org.jboss.netty.channel.MessageEvent;
 import org.jboss.netty.channel.SimpleChannelUpstreamHandler;
 import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
+import org.jboss.netty.handler.codec.http.*;
+import org.jboss.netty.handler.stream.ChunkedWriteHandler;
 
 public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
 	private final ClientSocketChannelFactory cf;
 	private final String remoteHost;
 	private final int remotePort;
+
+    private final RateConfigHolder rateConfigHolder = RateConfigHolder.INSTANCE;
+    private final Map<String, RateLimiter> rateConfig = rateConfigHolder.getRateConfig();
+
+    private final Pattern tenantPattern = Pattern.compile("[^/]*/api/([^/]*).*");
 
 	// This lock guards against the race condition that overrides the
 	// OP_READ flag incorrectly.
@@ -43,6 +54,10 @@ public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
 
 		// Start the connection attempt.
 		ClientBootstrap cb = new ClientBootstrap(cf);
+        cb.getPipeline()
+                .addLast("decoder", new HttpResponseDecoder());
+        cb.getPipeline()
+                .addLast("encoder", new HttpRequestEncoder());
 		cb.getPipeline()
 				.addLast("handler", new OutboundHandler(e.getChannel()));
 		ChannelFuture f = cb.connect(new InetSocketAddress(remoteHost,
@@ -67,10 +82,22 @@ public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
 	@Override
     public void messageReceived(ChannelHandlerContext ctx, final MessageEvent e)
             throws Exception {
-        ChannelBuffer msg = (ChannelBuffer) e.getMessage();
         //System.out.println(">>> " + ChannelBuffers.hexDump(msg));
         synchronized (trafficLock) {
-            outboundChannel.write(msg);
+            final HttpRequest httpRequest = (HttpRequest)e.getMessage();
+            System.out.println(String.format("%s -> %s", httpRequest.getMethod().getName(), httpRequest.getUri()));
+            final String tenant = extractTenantId(httpRequest.getUri());
+
+            if (tenant != null && rateConfig.get(tenant) != null){
+                final RateLimiter limiter = rateConfig.get(tenant);
+                long startTime = System.currentTimeMillis();
+                System.out.println("Acquiring conn for tenant " + tenant + ". Start: " + startTime);
+                limiter.acquire();
+                long endtime = System.currentTimeMillis();
+                System.out.println("Acquired conn for tenant " + tenant + ". Took: " + (endtime - startTime) / 1000 + " ms");
+            }
+
+            outboundChannel.write(httpRequest);
             // If outboundChannel is saturated, do not read until notified in
             // OutboundHandler.channelInterestChanged().
             if (!outboundChannel.isWritable()) {
@@ -119,10 +146,15 @@ public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
         @Override
         public void messageReceived(ChannelHandlerContext ctx, final MessageEvent e)
                 throws Exception {
-            ChannelBuffer msg = (ChannelBuffer) e.getMessage();
             //System.out.println("<<< " + ChannelBuffers.hexDump(msg));
             synchronized (trafficLock) {
-                inboundChannel.write(msg);
+                if(e.getMessage() instanceof HttpResponse){
+                    HttpResponse msg = (HttpResponse) e.getMessage();
+                    inboundChannel.write(msg);
+                } else {
+                    HttpChunk chunk = (HttpChunk)e.getMessage();
+                    inboundChannel.write(chunk);
+                }
                 // If inboundChannel is saturated, do not read until notified in
                 // HexDumpProxyInboundHandler.channelInterestChanged().
                 if (!inboundChannel.isWritable()) {
@@ -164,5 +196,15 @@ public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
         if (ch.isConnected()) {
             ch.write(ChannelBuffers.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
         }
+    }
+
+    private String extractTenantId(String uri){
+        final Matcher m = tenantPattern.matcher(uri);
+        if(m.matches()){
+            String tenant = m.group(1);
+            System.out.println("Tenant is found: " + tenant);
+            return tenant;
+        }
+        return null;
     }
 }
