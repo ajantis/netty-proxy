@@ -2,12 +2,12 @@ package org.zonca.zproxy;
 
 import java.net.InetSocketAddress;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.google.common.util.concurrent.RateLimiter;
 import org.jboss.netty.bootstrap.ClientBootstrap;
-import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFuture;
@@ -19,7 +19,6 @@ import org.jboss.netty.channel.MessageEvent;
 import org.jboss.netty.channel.SimpleChannelUpstreamHandler;
 import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
 import org.jboss.netty.handler.codec.http.*;
-import org.jboss.netty.handler.stream.ChunkedWriteHandler;
 
 public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
 	private final ClientSocketChannelFactory cf;
@@ -90,11 +89,16 @@ public class ProxyInboundHandler extends SimpleChannelUpstreamHandler {
 
             if (tenant != null && rateConfig.get(tenant) != null){
                 final RateLimiter limiter = rateConfig.get(tenant);
-                long startTime = System.currentTimeMillis();
-                System.out.println("Acquiring conn for tenant " + tenant + ". Start: " + startTime);
-                limiter.acquire();
-                long endtime = System.currentTimeMillis();
-                System.out.println("Acquired conn for tenant " + tenant + ". Took: " + (endtime - startTime) / 1000 + " ms");
+                if (limiter.tryAcquire(1, 2, TimeUnit.SECONDS)){
+                    long startTime = System.currentTimeMillis();
+                    System.out.println("Acquiring conn for tenant " + tenant + ". Start: " + startTime);
+
+                    limiter.acquire();
+
+                    long endtime = System.currentTimeMillis();
+                    System.out.println("Acquired conn for tenant " + tenant + ". Took: " + (endtime - startTime) + " ms");
+                } else
+                    return;
             }
 
             outboundChannel.write(httpRequest);
